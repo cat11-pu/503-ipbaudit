@@ -1,0 +1,13 @@
+# pacman_3d - the maze is flat-shaded polygons, the stages come from
+# examples/pacman/pacman_stages.c.
+EXAMPLE_EXTRA_SRCS = examples/pacman/pacman_game.c examples/pacman/pacman_level.c \
+                      examples/pacman/pacman_stages.c
+
+# Starfield for the VDP2 NBG0 layer behind the board. Regenerate the source
+# PNG from the original photo with tools/make_starfield.py; it is committed
+# so the build does not need the photo.
+EXAMPLE_INPUT        := examples/pacman_3d/assets/stars.png
+EXAMPLE_RESIZE       := 256 256
+EXAMPLE_ASSET_PREFIX := $(GENERATED_DIR)/pacman_3d/stars
+EXAMPLE_ASSETS       := $(EXAMPLE_ASSET_PREFIX).c
+EXAMPLE_HEADERS      := $(EXAMPLE_ASSET_PREFIX).h

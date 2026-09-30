@@ -1,0 +1,40 @@
+name: Physics 3D world host gate
+on:
+  push:
+    branches: [main]
+    paths:
+      - "include/saturn/physics3_world.h"
+      - "src/physics/3d/world.cpp"
+      - "include/saturn/collide3d.h"
+      - "include/saturn/mesh3d.h"
+      - "include/saturn/mesh3d_draw.h"
+      - "include/saturn/geometry3d.h"
+      - "include/saturn/render3d.h"
+      - "tests/tools/test_public_geometry_headers.py"
+      - "src/physics/3d/collision.cpp"
+      - "src/physics/3d/sweep.cpp"
+      - "src/physics/3d/sweep_full.cpp"
+      - "tests/host/test_collide3d_sweep.cpp"
+      - "tests/host/test_collide3d_sweep_full.cpp"
+      - "src/physics/3d/collision_grid.hpp"
+      - "tests/host/test_collide3d_grid.cpp"
+      - "tests/host/test_physics3_world.cpp"
+      - "Makefile"
+      - ".github/workflows/physics3-world-host.yml"
+  workflow_dispatch:
+jobs:
+  physics-world:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and execute bounded physics world tests
+        run: |
+          make build/tests/test_physics3_world build/tests/test_collide3d_grid build/tests/test_collide3d_sweep build/tests/test_collide3d_sweep_full
+          ./build/tests/test_physics3_world
+          ./build/tests/test_collide3d_grid
+          ./build/tests/test_collide3d_sweep
+          ./build/tests/test_collide3d_sweep_full
+      - name: Check C header compatibility
+        run: |
+          printf '#include "saturn/physics3_world.h"\nint main(void) { sat_physics3_world_t w = {0}; return (int)w.count; }\n' |
+            gcc -std=c11 -Wall -Wextra -Werror -Iinclude -x c -fsyntax-only -

@@ -1,0 +1,389 @@
+#include "src/hal/scsp/scsp.hpp"
+
+#include "src/hal/scsp/dsp_logic.hpp"
+
+#include "src/hal/smpc/smpc.hpp"
+#include "src/hal/scu/dma.hpp"
+#include "src/hal/scu/scu.hpp"
+
+namespace saturn::hal::scsp {
+
+namespace {
+
+constexpr uintptr_t kSoundRamBase = 0x25A00000u;
+constexpr uintptr_t kRegisterBase = 0x25B00000u;
+constexpr uintptr_t kCommonControlAddress = 0x25B00400u;
+constexpr uintptr_t kSlotStatusAddress = 0x25B00408u;
+constexpr uintptr_t kDspProgramAddress = 0x25B00800u;
+constexpr uint32_t kSlotStride = 0x20u;
+constexpr uint16_t kMem4Mb = 0x0200u;
+constexpr uint16_t kMasterVolumeMax = 0x000Fu;
+constexpr uint16_t kKeyOnExecute = 0x1000u;
+constexpr uint16_t kKeyOnBit = 0x0800u;
+constexpr uint16_t kPcm8Bit = 0x0010u;
+constexpr uint16_t kLoopNormal = 0x0020u;
+constexpr uint32_t kNativeRate = 44100u;
+
+bool g_ready = false;
+// Slot control (+00) contains write-only fields (including KYONB), so it
+// cannot be read-modified-written safely. Keep the programmed state here and
+// use it whenever a key transition needs KYONEX.
+uint16_t g_slot_control[kSlotCount] = {};
+// Slot register 0x14 (send to the DSP) and the low byte of 0x16 (return of EFREG n
+// through slot n) sit beside fields the voice code writes, so they are shadowed and
+// merged into every write of those registers.
+uint8_t g_default_send = 0u;
+uint8_t g_slot_send[kSlotCount] = {};
+uint8_t g_effect_return[16] = {};
+uint16_t g_direct_bits[kSlotCount] = {};   // DISDL and DIPAN, the top byte of 0x16
+
+inline uint16_t send_word_for(uint8_t slot) {
+    return dsp_logic::send_word(g_slot_send[slot], 0u);
+}
+
+inline uint16_t direct_word_for(uint8_t slot, uint8_t direct_level, uint8_t pan) {
+    g_direct_bits[slot] = static_cast<uint16_t>(
+        (static_cast<uint16_t>(direct_level > 7u ? 7u : direct_level) << 13) |
+        (static_cast<uint16_t>(pan & 0x1Fu) << 8));
+    return static_cast<uint16_t>(g_direct_bits[slot] | (slot < 16u ? g_effect_return[slot] : 0u));
+}
+
+inline volatile uint16_t* slot_word(uint8_t slot, uint32_t offset) {
+    return reinterpret_cast<volatile uint16_t*>(
+        kRegisterBase + static_cast<uintptr_t>(slot) * kSlotStride + offset
+    );
+}
+
+inline volatile uint16_t* common_control() {
+    return reinterpret_cast<volatile uint16_t*>(kCommonControlAddress);
+}
+
+inline volatile uint16_t* sound_ram_word(uint32_t byte_offset) {
+    return reinterpret_cast<volatile uint16_t*>(kSoundRamBase + byte_offset);
+}
+
+inline void write_sound_word(uint32_t byte_offset, uint16_t value) {
+    *sound_ram_word(byte_offset) = value;
+}
+
+inline void install_idle_68k_stub() {
+    // Reset SSP = 0x0007FFF0, reset PC = 0x00000008, then BRA.S -2.
+    // Sound RAM is accessed by the SH-2 in 16-bit units.
+    write_sound_word(0x0000u, 0x0007u);
+    write_sound_word(0x0002u, 0xFFF0u);
+    write_sound_word(0x0004u, 0x0000u);
+    write_sound_word(0x0006u, 0x0008u);
+    write_sound_word(0x0008u, 0x60FEu);
+}
+
+inline void clear_dsp_program() {
+    volatile uint16_t* p = reinterpret_cast<volatile uint16_t*>(kDspProgramAddress);
+    for (uint32_t i = 0; i < 512u; ++i) {
+        p[i] = 0u;
+    }
+}
+
+inline void clear_slot_registers() {
+    for (uint8_t slot = 0; slot < kSlotCount; ++slot) {
+        for (uint32_t offset = 0; offset < 0x18u; offset += 2u) {
+            *slot_word(slot, offset) = 0u;
+        }
+    }
+}
+
+/* Waits longer than one 44.1 kHz SCSP sample period: with the calibrated
+ * FRT, eight /128 ticks are comfortably longer. */
+void wait_one_sample() {
+    if (saturn::hal::scu::ticks_per_frame() != 0u) {
+        const uint64_t start = saturn::hal::scu::elapsed_ticks();
+        while (saturn::hal::scu::elapsed_ticks() - start < 8u) {
+        }
+    } else {
+        // Frame-clock calibration can fail on a non-advancing display. In
+        // that degraded case, repeated volatile SCSP reads provide a bounded
+        // settling delay without introducing another timer dependency.
+        volatile uint16_t* status =
+            reinterpret_cast<volatile uint16_t*>(kSlotStatusAddress);
+        uint16_t discard = 0u;
+        for (uint16_t i = 0u; i < 256u; ++i) {
+            discard = *status;
+        }
+        (void)discard;
+    }
+}
+
+inline void execute_key_transition(uint8_t slot) {
+    *slot_word(slot, 0x00u) = g_slot_control[slot];
+    *slot_word(slot, 0x00u) = static_cast<uint16_t>(g_slot_control[slot] | kKeyOnExecute);
+}
+
+}  // namespace
+
+void wait_samples(uint32_t count) {
+    for (uint32_t i = 0u; i < count; ++i) wait_one_sample();
+}
+
+bool init() {
+    if (g_ready) {
+        return true;
+    }
+
+    // Hold the 68k before replacing vectors/program data. The SH-2 remains
+    // able to initialize the sound block while the sound CPU is reset.
+    if (!smpc::sound_off()) {
+        return false;
+    }
+
+    *common_control() = kMem4Mb;
+    clear_sound_ram(0u, kSystemReservedBytes);
+    install_idle_68k_stub();
+    clear_slot_registers();
+    for (uint8_t slot = 0u; slot < kSlotCount; ++slot) {
+        g_slot_control[slot] = 0u;
+        g_slot_send[slot] = 0u;
+        g_direct_bits[slot] = 0u;
+    }
+    for (uint8_t i = 0u; i < 16u; ++i) g_effect_return[i] = 0u;
+    g_default_send = 0u;
+    clear_dsp_program();
+
+    if (!smpc::sound_on()) {
+        return false;
+    }
+
+    *common_control() = static_cast<uint16_t>(kMem4Mb | kMasterVolumeMax);
+    g_ready = true;
+    return true;
+}
+
+void shutdown() {
+    if (!g_ready) {
+        return;
+    }
+    stop_all_slots();
+    *common_control() = kMem4Mb;
+    g_ready = false;
+}
+
+bool is_ready() {
+    return g_ready;
+}
+
+bool read_current_sample_block(uint8_t slot, uint8_t* out_block) {
+    if (!g_ready || slot >= kSlotCount || out_block == nullptr) return false;
+
+    volatile uint16_t* status =
+        reinterpret_cast<volatile uint16_t*>(kSlotStatusAddress);
+
+    // p04_28: writing MSLC selects the monitored slot; reading the same word
+    // returns CA in bits 7..10, where one CA unit is 4096 samples. The monitor
+    // value is latched by the SCSP slot pipeline, so do not trust an immediate
+    // read after changing MSLC.
+    *status = static_cast<uint16_t>(static_cast<uint16_t>(slot) << 11u);
+    wait_one_sample();
+
+    const uint16_t value = *status;
+    *out_block = static_cast<uint8_t>((value >> 7u) & 0x0Fu);
+    return true;
+}
+
+bool upload(uint32_t offset, const void* data, uint32_t byte_count) {
+    if (data == nullptr || (offset & 1u) != 0u || offset >= kSoundRamBytes ||
+        byte_count > (kSoundRamBytes - offset)) {
+        return false;
+    }
+
+    // The main SH-2 accesses SCSP sound RAM in 16-bit units. Pack source
+    // bytes explicitly so this also works for signed PCM8 payloads.
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    uint32_t i = 0u;
+    /* The longword-aligned bulk goes by SCU-DMA (the byte stream is the same
+     * big-endian image the halfword loop below writes); the tail and any
+     * transfer DMA cannot take stay on the CPU. */
+    const uint32_t bulk = byte_count & ~3u;
+    if (bulk != 0u &&
+        scu::dma::copy(const_cast<uint16_t*>(sound_ram_word(offset)), src, bulk) == SAT_OK) {
+        i = bulk;
+    }
+    for (; i + 1u < byte_count; i += 2u) {
+        const uint16_t word = static_cast<uint16_t>(
+            (static_cast<uint16_t>(src[i]) << 8) | src[i + 1u]
+        );
+        write_sound_word(offset + i, word);
+    }
+    if (i < byte_count) {
+        write_sound_word(offset + i, static_cast<uint16_t>(src[i]) << 8);
+    }
+    return true;
+}
+
+void clear_sound_ram(uint32_t offset, uint32_t byte_count) {
+    if ((offset & 1u) != 0u || offset >= kSoundRamBytes) {
+        return;
+    }
+    if (byte_count > (kSoundRamBytes - offset)) {
+        byte_count = kSoundRamBytes - offset;
+    }
+    const uint32_t words = (byte_count + 1u) / 2u;
+    for (uint32_t i = 0u; i < words; ++i) {
+        write_sound_word(offset + i * 2u, 0u);
+    }
+}
+
+uint16_t sound_word(uint32_t byte_offset) {
+    return *sound_ram_word(byte_offset);
+}
+
+void set_sound_word(uint32_t byte_offset, uint16_t value) {
+    write_sound_word(byte_offset, value);
+}
+
+bool restore_idle_68k() {
+    if (!smpc::sound_off()) return false;
+    install_idle_68k_stub();
+    return smpc::sound_on();
+}
+
+uint16_t timed_key_word(uint8_t slot, bool on) {
+    if (slot >= kSlotCount) return 0u;
+    g_slot_control[slot] = on ? static_cast<uint16_t>(g_slot_control[slot] | kKeyOnBit)
+                              : static_cast<uint16_t>(g_slot_control[slot] & ~kKeyOnBit);
+    return static_cast<uint16_t>(g_slot_control[slot] | kKeyOnExecute);
+}
+
+uint16_t encode_pitch(uint32_t sample_rate, uint32_t pitch_scale_q16) {
+    if (sample_rate == 0u || pitch_scale_q16 == 0u) {
+        return 0u;
+    }
+
+    uint64_t num = static_cast<uint64_t>(sample_rate) * static_cast<uint64_t>(pitch_scale_q16);
+    uint64_t den = static_cast<uint64_t>(kNativeRate) << 16;
+    int32_t octave = 0;
+
+    while (num < den && octave > -8) {
+        num <<= 1;
+        --octave;
+    }
+    while (num >= (den << 1) && octave < 7) {
+        den <<= 1;
+        ++octave;
+    }
+
+    uint32_t fns = 0u;
+    if (num > den) {
+        fns = static_cast<uint32_t>(((num - den) * 1024u + (den / 2u)) / den);
+        if (fns > 1023u) {
+            fns = 1023u;
+        }
+    }
+
+    return static_cast<uint16_t>(((static_cast<uint32_t>(octave) & 0x0Fu) << 11) | fns);
+}
+
+uint8_t encode_pan(int16_t pan) {
+    if (pan > 15) pan = 15;
+    if (pan < -15) pan = -15;
+    if (pan == 0) return 0u;
+    if (pan > 0) return static_cast<uint8_t>(pan & 0x0F);
+    return static_cast<uint8_t>(0x10u | ((-pan) & 0x0F));
+}
+
+bool configure_slot(uint8_t slot, const SlotConfig& config) {
+    if (!g_ready || slot >= kSlotCount || config.sample_count == 0u || config.start_address >= kSoundRamBytes) {
+        return false;
+    }
+
+    key_off(slot);
+
+    uint16_t control = static_cast<uint16_t>((config.start_address >> 16) & 0x0Fu);
+    if (config.pcm8 != 0u) control |= kPcm8Bit;
+    if (config.loop != 0u) control |= kLoopNormal;
+
+    g_slot_control[slot] = control;
+    *slot_word(slot, 0x00u) = control;
+    *slot_word(slot, 0x02u) = static_cast<uint16_t>(config.start_address & 0xFFFFu);
+    *slot_word(slot, 0x04u) = config.loop_start;
+    *slot_word(slot, 0x06u) = config.loop_end;
+
+    *slot_word(slot, 0x08u) = 0x001Fu;
+    *slot_word(slot, 0x0Au) = 0x3C1Fu;
+    *slot_word(slot, 0x0Cu) = static_cast<uint16_t>(config.total_level);
+    *slot_word(slot, 0x0Eu) = 0u;
+    *slot_word(slot, 0x10u) = encode_pitch(config.sample_rate, config.pitch_scale_q16);
+    *slot_word(slot, 0x12u) = 0u;
+    g_slot_send[slot] = g_default_send;
+    *slot_word(slot, 0x14u) = send_word_for(slot);
+    *slot_word(slot, 0x16u) = direct_word_for(slot, config.direct_level, config.pan);
+    return true;
+}
+
+void key_on(uint8_t slot) {
+    if (!g_ready || slot >= kSlotCount) return;
+    g_slot_control[slot] = static_cast<uint16_t>(g_slot_control[slot] | kKeyOnBit);
+    execute_key_transition(slot);
+}
+
+void arm_key_on(uint8_t slot) {
+    if (!g_ready || slot >= kSlotCount) return;
+    // KYONEX is latched and applied at the next sample: one still pending
+    // (e.g. configure_slot's own key-off) would key this slot on right now.
+    wait_one_sample();
+    g_slot_control[slot] = static_cast<uint16_t>(g_slot_control[slot] | kKeyOnBit);
+    *slot_word(slot, 0x00u) = g_slot_control[slot];
+}
+
+void execute_key_transitions() {
+    if (!g_ready) return;
+    // KYONEX written through any slot applies every slot's KYONB.
+    *slot_word(0u, 0x00u) = static_cast<uint16_t>(g_slot_control[0u] | kKeyOnExecute);
+}
+
+void key_off(uint8_t slot) {
+    if (slot >= kSlotCount) return;
+    g_slot_control[slot] = static_cast<uint16_t>(g_slot_control[slot] & ~kKeyOnBit);
+    execute_key_transition(slot);
+}
+
+void mute_slot(uint8_t slot) {
+    if (!g_ready || slot >= kSlotCount) return;
+    *slot_word(slot, 0x0Cu) = 0x00FFu;
+}
+
+void set_slot_level_pan(uint8_t slot, uint8_t total_level, uint8_t direct_level, uint8_t pan) {
+    if (!g_ready || slot >= kSlotCount) return;
+    *slot_word(slot, 0x0Cu) = static_cast<uint16_t>(total_level);
+    *slot_word(slot, 0x16u) = direct_word_for(slot, direct_level, pan);
+}
+
+void set_default_effect_send(uint8_t level) {
+    g_default_send = level > dsp_logic::kMaxLevel ? dsp_logic::kMaxLevel : level;
+}
+
+void set_effect_send(uint8_t slot, uint8_t level) {
+    if (!g_ready || slot >= kSlotCount) return;
+    g_slot_send[slot] = level > dsp_logic::kMaxLevel ? dsp_logic::kMaxLevel : level;
+    *slot_word(slot, 0x14u) = send_word_for(slot);
+}
+
+void set_effect_return(uint8_t efreg, uint8_t level, uint8_t pan) {
+    if (efreg >= 16u) return;
+    g_effect_return[efreg] = static_cast<uint8_t>(dsp_logic::return_bits(level, pan));
+    if (!g_ready) return;
+    *slot_word(efreg, 0x16u) = static_cast<uint16_t>(g_direct_bits[efreg] | g_effect_return[efreg]);
+}
+
+void set_master_volume(uint8_t level) {
+    if (level > 15u) level = 15u;
+    *common_control() = static_cast<uint16_t>(kMem4Mb | level);
+}
+
+void stop_all_slots() {
+    if (!g_ready) return;
+    for (uint8_t slot = 0; slot < kSlotCount; ++slot) {
+        g_slot_control[slot] = static_cast<uint16_t>(g_slot_control[slot] & ~kKeyOnBit);
+        *slot_word(slot, 0x00u) = g_slot_control[slot];
+    }
+    *slot_word(0u, 0x00u) = static_cast<uint16_t>(g_slot_control[0u] | kKeyOnExecute);
+}
+
+}  // namespace saturn::hal::scsp

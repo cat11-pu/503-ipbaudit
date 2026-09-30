@@ -1,0 +1,44 @@
+name: Harness build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "harness/**"
+      - ".github/workflows/harness.yml"
+  pull_request:
+    paths:
+      - "harness/**"
+      - ".github/workflows/harness.yml"
+  workflow_dispatch:
+
+jobs:
+  build-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install harness build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Configure pinned Ymir harness
+        run: cmake -S harness -B harness/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build probe
+        run: cmake --build harness/build-ci --target probe -j2
+
+      # A BIOS dump cannot be distributed in CI. Exercise the acceptance
+      # mask itself and explicitly SKIP the BIOS-backed screenshot checks.
+      # The complete scene test runs via run-scene-cache-occlusion.ps1 using
+      # the user's own firmware and pinned emulator probe.
+      - name: Test occlusion image criterion without BIOS
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify synthetic occlusion acceptance criterion
+        run: |
+          python -m pip install pillow
+          python -m unittest discover harness/tests -p test_scene_cache_occlusion.py -v

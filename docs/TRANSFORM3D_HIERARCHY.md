@@ -1,0 +1,60 @@
+# Transform hierarchy — initial reusable slice
+
+This implementation introduces a caller-owned 3D transform forest in `transform3d.h`.
+It extends existing `sat_model_transform3d_t` and `sat_model_transform3d_matrix`
+rather than replacing the scene renderer, camera, physics, or animation systems.
+
+## Contract
+
+- Create stable node IDs in a bounded pool; `SAT_TRANSFORM3D_ROOT` detaches a node.
+- Parent assignment rejects self-parenting and cycles. Reparenting preserves local,
+  **not world**, coordinates; callers may compute a different local transform if needed.
+- Mutations invalidate the hierarchy; `get_world` returns `SAT_ERR_BUSY` until
+  `evaluate` succeeds. The caller owns the `uint16_t[count]` evaluation scratch.
+- Evaluation is iterative and parent-first, including when the parent was created
+  after the child; only changed nodes and descendants recompute their matrices.
+- All matrix results use the existing 16.16 fixed-point math and T*Ry*Rx*Rz*S
+  convention. Do not interpret `world` as a collision pose without checking
+  scale and local-space physics requirements.
+- There is no node removal, reparent-preserve-world helper, interpolation,
+  direct renderer ownership, or automatic synchronization with
+  physics in this slice. Reset invalidates all IDs; IDs may then be reused.
+- Storage must remain live for the world's lifetime. The application must not
+  mutate public node fields or use the same scratch buffer as the node pool.
+
+## Native consumers
+
+Games evaluate the hierarchy once after simulation and submit model instances
+through `sat_scene_submit_transform_instance` in `scene.h`. The opt-in adapter
+binds the evaluated node matrix without mutating the input instance or retaining
+scratch pointers. All polygons still use the canonical `sat_scene_t` painter.
+`examples/runtime_3d` exercises a parent/child hierarchy on Saturn.
+Cameras and physics may consume evaluated matrices after explicit conversions;
+no collider parenting or physics synchronisation is implicit.
+
+## Validation
+
+Run `make test` (includes `test_transform3d`) and build representative
+3D examples. The added host tests cover propagation, cache reuse, cycle
+rejection, capacity, detach/reset, and parents created after children.
+Physical Saturn/emulator frame-time qualification remains pending.
+
+## Exact local matrices and one-way physics synchronization
+
+`sat_transform3d_set_local_matrix` copies an unscaled/scaled affine pose
+without losing quaternion orientation through Euler-angle conversion. This
+mode composes with parent transforms exactly like the existing local TRS mode;
+`sat_transform3d_set_local` switches that node back to TRS. After either
+setter, `evaluate` updates changed nodes and their descendants. The setter
+requires the homogeneous affine last row `[0,0,0,ONE]`; it does not
+orthonormalize arbitrary matrices or compute inverse-parent transforms.
+
+`physics3_transform.h` provides an explicitly called one-way bridge:
+`sat_physics3_sync_sphere_transform(&physics, sphere_id, &hierarchy, node_id)`.
+Call after a successful physics step and before hierarchy evaluation. The
+bridge binds the sphere's exact world model matrix as a **ROOT** node's local
+matrix; children (for example, sphere stripes and attached decorations)
+inherit that motion. A parented target is rejected without mutating the
+hierarchy, because applying a world pose as a child-local pose would double
+its parent transform. The physics world never reads back the visual hierarchy:
+this does not implement automatic collider parenting or moving-mesh physics.

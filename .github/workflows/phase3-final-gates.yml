@@ -1,0 +1,200 @@
+name: Phase 3 final gates
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Makefile
+      - "include/**"
+      - "src/**"
+      - "examples/**"
+      - "tests/**"
+      - "scripts/**"
+      - "tools/**"
+      - .github/workflows/phase3-final-gates.yml
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host and toolchain build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential texinfo bison flex wget xz-utils genisoimage python3-pil
+
+      # Model import and city asset-pipeline tests share this interpreter.
+      - name: Set up Python for model import
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install model importer dependencies
+        run: python -m pip install -r tools/requirements-city.txt
+
+      - name: Run city asset pipeline tests
+        run: python tests/test_city_chunker.py
+
+      - name: Build real city archive and verify facade coverage
+        run: |
+          rm -rf /tmp/city-walk-ci
+          mkdir -p /tmp/city-walk-ci/iso
+          python tools/city_chunker.py \
+            --input examples/city_walk/assets/low_poly_city.glb \
+            --out-bin /tmp/city-walk-ci/iso/CITY.BIN \
+            --out-h /tmp/city-walk-ci/city_data.h \
+            --cache-dir /tmp/city-walk-ci/cache --incremental \
+            --lod-caps 512:256,144:64,48:24 --face-budget 600 --ground-upd 1,1 \
+            --light-dir=-0.5,0.6,0.8 --ambient 0.42 --diffuse 0.60 \
+            --max-archive-bytes 4718592 --report /tmp/city-walk-ci/city.report.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("/tmp/city-walk-ci/city.report.json").read_text())
+          foliage = report["foliage"]
+          assert foliage["items"] == 480, foliage
+          assert foliage["source_mask"] == 302, foliage
+          assert foliage["mesh_impostors"] == 178, foliage
+          rates = [[], [], []]
+          foliage_widths = [[], [], []]
+          for chunk, row in report["per_chunk"].items():
+              for lod in range(3):
+                  item = row.get(f"lod{lod}")
+                  if not item:
+                      continue
+                  expected_textures = (
+                      item["faces"] - item.get("foliage", 0) +
+                      item.get("foliage_unique_textures", 0)
+                  )
+                  assert item["textures"] == expected_textures, (
+                      f"chunk {chunk} LOD{lod}: {item['textures']} textures, "
+                      f"expected {expected_textures} after foliage dedup"
+                  )
+                  if item["faces"] > item.get("foliage", 0):
+                      rates[lod].append(item["texture_rate"])
+                  if item.get("foliage", 0):
+                      foliage_widths[lod].append(item["foliage_texture_min_width"])
+          facade_floors = [2.0, 1.0, 0.5]
+          for lod, values in enumerate(rates):
+              if values:
+                  assert min(values) >= facade_floors[lod], (
+                      lod, min(values), facade_floors[lod])
+          floors = [32, 24, 16]
+          for lod, values in enumerate(foliage_widths):
+              if values:
+                  assert min(values) >= floors[lod], (lod, min(values), floors[lod])
+          assert report["archive"]["blob_region_bytes"] + 32 <= 4 * 1024 * 1024
+          print("real city archive bytes:", report["archive"]["total_bytes"])
+          print("cart blob region bytes:", report["archive"]["blob_region_bytes"])
+          print("foliage:", foliage)
+          print("block level histogram:", report["chunks"]["block_level_histogram_by_lod"])
+          assert report["chunks"]["block_level_histogram_by_lod"][0][0] > 0, (
+              "the superfine LOD0 building level was never selected")
+          for lod, values in enumerate(rates):
+              if values:
+                  print(f"LOD{lod} texture rate range: {min(values)}..{max(values)}")
+              if foliage_widths[lod]:
+                  print(f"LOD{lod} foliage min width: {min(foliage_widths[lod])}")
+          PY
+
+      - name: Run host tests
+        run: make test
+
+      - name: Build SH-2 toolchain
+        env:
+          PREFIX: ${{ runner.temp }}/saturn-tools
+          ROOT: ${{ runner.temp }}/saturn-toolchain-src
+        run: |
+          JOBS=2 bash scripts/build-toolchain.sh
+
+      - name: Build save and read-only cartridge examples
+        run: |
+          export PATH="${RUNNER_TEMP}/saturn-tools/bin:$PATH"
+          # Keep save support independently cross-compiled even while an
+          # unrelated optional example asset can stop examples-all early.
+          make clean
+          make IP_TEMPLATE_KIND=sbl EXAMPLE=save_backup_demo all
+          make IP_TEMPLATE_KIND=sbl EXAMPLE=save_cartridge_probe all
+
+      # The optional GLB for basic_3d_animation is not included in clean
+      # clones, so examples-all can fail before reaching skybridge_3d.
+      # Verify this playable example independently first.
+      - name: Build Skybridge 3D
+        run: |
+          export PATH="${RUNNER_TEMP}/saturn-tools/bin:$PATH"
+          make clean
+          make IP_TEMPLATE_KIND=sbl EXAMPLE=skybridge_3d all
+
+      - name: Build all Saturn examples
+        id: crossbuild
+        run: |
+          export PATH="${RUNNER_TEMP}/saturn-tools/bin:$PATH"
+          sh2eb-elf-g++ --version
+          make clean
+          set +e
+          # Only the SBL IP template is intentionally versioned. Local builds
+          # may select the ignored YAUL template when present, but CI must use
+          # a boot template available in every clean clone.
+          # The animated demo's third-party GLB fixture is NOT versioned.
+          # Do not pretend it passed or stop verification of the other demos:
+          # exclude only this one when the fixture is absent, and say so.
+          if [ ! -f examples/basic_3d_animation/assets/male_basic_walk_30_frames_loop.glb ]; then
+            echo "::notice title=Fixture unavailable::basic_3d_animation is not cross-built: source GLB is absent from this clean clone"
+            echo '### Explicit unbuilt fixture' >> "$GITHUB_STEP_SUMMARY"
+            echo 'basic_3d_animation: absent male_basic_walk_30_frames_loop.glb (not tested)' >> "$GITHUB_STEP_SUMMARY"
+            make IP_TEMPLATE_KIND=sbl EXAMPLES_ALL_SKIP=basic_3d_animation examples-all > examples-all.log 2>&1
+          else
+            make IP_TEMPLATE_KIND=sbl examples-all > examples-all.log 2>&1
+          fi
+          status=$?
+          set -e
+          first_error="$(grep -m1 -E 'fatal error:|undefined reference|collect2: error|make(\\[[0-9]+\\])?: \\*\\*\\*|region .*overflowed by|will not fit in region|^([^[:space:]]+:[0-9]+(:[0-9]+)?: )?error:' examples-all.log || true)"
+          if [ -z "$first_error" ] && [ "$status" -ne 0 ]; then
+            first_error="examples-all failed; see examples-all.log"
+          fi
+          printf '%s\n' "$first_error" > first-failure.txt
+          cat examples-all.log
+          # Keep evidence for precise memory-budget work. A failed linker
+          # still emits a partial .map with the actual WRAMH/WRAML owners.
+          # Never silence the failing cross-build gate or invent extra RAM.
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '### Per-object Saturn section sizes (bytes)'
+              sh2eb-elf-size -A build/generated/infinite_explorer/*.o build/examples/infinite_explorer/main.o build/libsaturn.a 2>&1 || true
+              echo '### Largest named source allocations (bytes)'
+              sh2eb-elf-nm --print-size --size-sort --radix=d build/generated/infinite_explorer/*.o build/examples/infinite_explorer/main.o build/libsaturn.a 2>&1 | tail -n 100 || true
+            } > memory-diagnostics.txt
+            echo '### Memory diagnostics' >> "$GITHUB_STEP_SUMMARY"
+            echo 'See memory-diagnostics.txt and the partial linker map in the cross-build artifact.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            escaped="${first_error//'%'/'%25'}"
+            escaped="${escaped//$'\r'/'%0D'}"
+            escaped="${escaped//$'\n'/'%0A'}"
+            echo "::error title=Saturn examples-all failed::$escaped"
+            echo '### First Saturn cross-build failure' >> "$GITHUB_STEP_SUMMARY"
+            grep -m5 -E 'fatal error:|undefined reference|collect2: error|make(\\[[0-9]+\\])?: \\*\\*\\*|region .*overflowed by|will not fit in region|^([^[:space:]]+:[0-9]+(:[0-9]+)?: )?error:' examples-all.log >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+
+      - name: Preserve Saturn cross-build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saturn-cross-build-diagnostics
+          path: |
+            examples-all.log
+            first-failure.txt
+            memory-diagnostics.txt
+            build/infinite_explorer.map
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce Saturn cross-build gate
+        if: steps.crossbuild.outputs.status != '0'
+        run: exit "${{ steps.crossbuild.outputs.status }}"
+
+      - name: Check repository hygiene
+        run: git diff --check

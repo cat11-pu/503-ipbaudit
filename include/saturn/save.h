@@ -1,0 +1,138 @@
+#ifndef SATURN_SAVE_H
+#define SATURN_SAVE_H
+
+#include <stdint.h>
+
+#include "saturn/core.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SAT_SAVE_NAME_MAX 11u
+#define SAT_SAVE_COMMENT_MAX 10u
+/* Maximum number of directory entries materialized by one sat_save_list()
+ * call. out_total can still report more matches; callers can use a narrower
+ * pattern when they need a specific record. */
+#define SAT_SAVE_LIST_MAX 32u
+
+/* These are LibSaturn logical device IDs, not raw Sega BUP unit IDs.
+ * The internal device uses BIOS configuration-table index 0. That entry's
+ * BupConfig.unit_id is BUP_MAIN_UNIT (1), a separate namespace. */
+typedef enum sat_save_device {
+    SAT_SAVE_INTERNAL = 0,
+    /* The persistent Backup Memory cartridge, through the same BIOS Backup
+     * Library calls as the internal memory. Its BIOS selector is the
+     * BUP_Init configuration entry whose unit_id is 2. With no cartridge every
+     * call returns SAT_ERR_NOT_CONNECTED before any BIOS call is made.
+     * Nothing is ever migrated or formatted implicitly. */
+    SAT_SAVE_BACKUP_CARTRIDGE = 1
+} sat_save_device_t;
+
+typedef enum sat_save_language {
+    SAT_SAVE_JAPANESE = 0,
+    SAT_SAVE_ENGLISH = 1,
+    SAT_SAVE_FRENCH = 2,
+    SAT_SAVE_GERMAN = 3,
+    SAT_SAVE_SPANISH = 4,
+    SAT_SAVE_ITALIAN = 5
+} sat_save_language_t;
+
+typedef struct sat_save_record {
+    const char* name;
+    const char* comment;
+    sat_save_language_t language;
+    /* Raw BUP timestamp. Zero is allowed when the caller does not yet have an
+     * RTC-derived timestamp. */
+    uint32_t date;
+} sat_save_record_t;
+
+typedef struct sat_save_entry {
+    char name[SAT_SAVE_NAME_MAX + 1u];
+    char comment[SAT_SAVE_COMMENT_MAX + 1u];
+    sat_save_language_t language;
+    uint32_t date;
+    uint32_t data_size;
+    uint16_t block_size;
+    uint16_t reserved;
+} sat_save_entry_t;
+
+typedef struct sat_save_storage_info {
+    uint32_t total_size;
+    uint32_t total_blocks;
+    uint32_t block_size;
+    uint32_t free_size;
+    uint32_t free_blocks;
+    /* Number of records of prospective_data_size that the BIOS reports can
+     * still fit. This is not the current directory-entry count. */
+    uint32_t fit_count;
+} sat_save_storage_info_t;
+
+/* Snapshot of BUP_Init device configuration, not a hot-plug detector.
+ * It does not query capacity or perform any read/write on the medium. */
+typedef struct sat_save_device_info {
+    uint8_t connected;
+    uint8_t partition_count;
+    uint16_t reserved;
+} sat_save_device_info_t;
+
+/* Initializes the Boot ROM BUP service. Never formats storage implicitly. */
+sat_result_t sat_save_init(void);
+
+/* Read-only connection/partition discovery from the BUP_Init configuration
+ * snapshot. A missing cart returns SAT_OK with connected=0. Reinitialize
+ * after changing hardware by restarting the Saturn program. */
+sat_result_t sat_save_device_info(
+    sat_save_device_t device,
+    sat_save_device_info_t* out_info);
+
+/* Query storage capacity. prospective_data_size may be zero. */
+sat_result_t sat_save_storage_info(
+    sat_save_device_t device,
+    uint32_t prospective_data_size,
+    sat_save_storage_info_t* out_info);
+
+/* List matching records. A null or empty pattern, or "*", lists everything
+ * (the BIOS has no wildcard: it lists all files for an empty name).
+ * out_total receives the total number of matches even when capacity is
+ * smaller; entries contains min(*out_total, capacity) records.
+ * capacity must not exceed SAT_SAVE_LIST_MAX. */
+sat_result_t sat_save_list(
+    sat_save_device_t device,
+    const char* pattern,
+    sat_save_entry_t* entries,
+    uint16_t capacity,
+    uint16_t* out_total);
+
+sat_result_t sat_save_read(
+    sat_save_device_t device,
+    const char* name,
+    void* destination,
+    uint32_t capacity,
+    uint32_t* out_size);
+
+sat_result_t sat_save_write(
+    sat_save_device_t device,
+    const sat_save_record_t* record,
+    const void* data,
+    uint32_t data_size,
+    uint8_t overwrite);
+
+sat_result_t sat_save_verify(
+    sat_save_device_t device,
+    const char* name,
+    const void* data,
+    uint32_t data_size);
+
+sat_result_t sat_save_delete(
+    sat_save_device_t device,
+    const char* name);
+
+/* Destructive. The caller must request formatting explicitly. */
+sat_result_t sat_save_format(sat_save_device_t device);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SATURN_SAVE_H */

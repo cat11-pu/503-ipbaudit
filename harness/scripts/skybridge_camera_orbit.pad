@@ -1,0 +1,20 @@
+# Stationary camera-orbit regression for Skybridge 3D.
+# Keep the avatar at its spawn point: only rotate the camera by six B taps
+# (90 degrees). The pilot must stay on the initial deck in BOTH views;
+# its projected position changes naturally, but its world coords do not.
+# Toggle Y debug HUD at frame 70; DECK must stay 1 before and after six taps.
+0    NONE
+130  Y
+145  NONE
+165  B
+166  NONE
+169  B
+170  NONE
+173  B
+174  NONE
+177  B
+178  NONE
+181  B
+182  NONE
+185  B
+186  NONE

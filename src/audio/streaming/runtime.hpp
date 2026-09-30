@@ -1,0 +1,223 @@
+#ifndef SATURN_CORE_AUDIO_STREAM_RUNTIME_HPP
+#define SATURN_CORE_AUDIO_STREAM_RUNTIME_HPP
+
+#include <stdint.h>
+
+#include "saturn/audio.h"
+
+namespace saturn::core {
+
+using StreamCopyWord = uint32_t __attribute__((may_alias));
+
+inline void stream_copy_bytes(uint8_t* destination, const uint8_t* source,
+                              uint32_t bytes) {
+    uint32_t copied = 0u;
+    if (((reinterpret_cast<uintptr_t>(destination) |
+          reinterpret_cast<uintptr_t>(source)) & 3u) == 0u) {
+        StreamCopyWord* out = reinterpret_cast<StreamCopyWord*>(destination);
+        const StreamCopyWord* in = reinterpret_cast<const StreamCopyWord*>(source);
+        const uint32_t words = bytes / 4u;
+        for (uint32_t i = 0u; i < words; ++i) out[i] = in[i];
+        copied = words * 4u;
+    }
+    for (; copied < bytes; ++copied) destination[copied] = source[copied];
+}
+
+constexpr uint16_t kAudioStreamCapacity = 4u;
+constexpr uint8_t kAudioStreamScspSlotBase = 28u;
+// Each half spans several display frames at common music rates, leaving
+// enough time for cooperative refills even around synchronous CD work.
+constexpr uint32_t kAudioStreamChunkFrames = 4096u;
+constexpr uint32_t kAudioStreamChunkBytes = kAudioStreamChunkFrames * 2u;
+constexpr uint32_t kAudioStreamRamBytes =
+    static_cast<uint32_t>(kAudioStreamCapacity) * 2u * kAudioStreamChunkBytes;
+constexpr uint32_t kAudioStreamRamBase = 0x80000u - kAudioStreamRamBytes;
+
+struct AudioStreamRing {
+    uint8_t* buffer;
+    uint32_t capacity_frames;
+    uint32_t frame_bytes;
+    uint32_t read_frame;
+    uint32_t write_frame;
+    uint32_t buffered_frames;
+    uint32_t underrun_count;
+    uint32_t rejected_write_count;
+    uint32_t minimum_fill;
+    uint32_t maximum_fill;
+    uint8_t paused;
+};
+
+struct AudioStreamSlot {
+    AudioStreamRing ring;
+    uint32_t sample_rate;
+    uint32_t sound_ram_offset;
+    uint32_t playback_end_frame;
+    uint32_t playback_start_frame;
+    uint32_t playback_chunk_frames;
+    uint32_t serviced_chunks;
+    uint32_t consumed_frames;
+    uint32_t refill_count;
+    uint32_t monitor_frame;
+    uint8_t format;
+    uint8_t scsp_slot;
+    uint8_t playback_buffer;
+    uint8_t hardware_playing;
+    uint8_t pan;
+    uint8_t seamless_loop;
+    uint8_t pending_refill;
+    uint16_t reserved1;
+    uint8_t staging[kAudioStreamChunkBytes];
+    uint16_t generation;
+    uint8_t used;
+    uint8_t reserved;
+};
+
+struct AudioStreamRegistry {
+    AudioStreamSlot slots[kAudioStreamCapacity];
+};
+
+extern AudioStreamRegistry g_audio_streams;
+
+inline uint16_t next_audio_stream_generation(uint16_t generation) {
+    ++generation;
+    return generation == 0u ? 1u : generation;
+}
+
+inline void audio_stream_ring_reset(AudioStreamRing& ring) {
+    ring.read_frame = 0u;
+    ring.write_frame = 0u;
+    ring.buffered_frames = 0u;
+    ring.underrun_count = 0u;
+    ring.rejected_write_count = 0u;
+    ring.minimum_fill = ring.capacity_frames;
+    ring.maximum_fill = 0u;
+    ring.paused = 0u;
+}
+
+inline void audio_stream_registry_reset(AudioStreamRegistry& registry) {
+    for (uint16_t i = 0u; i < kAudioStreamCapacity; ++i) {
+        AudioStreamSlot& slot = registry.slots[i];
+        slot.generation = next_audio_stream_generation(slot.generation);
+        slot.used = 0u;
+        slot.ring = {};
+        slot.sample_rate = 0u;
+        slot.sound_ram_offset = 0u;
+        slot.playback_end_frame = 0u;
+        slot.playback_start_frame = 0u;
+        slot.playback_chunk_frames = 0u;
+        slot.serviced_chunks = 0u;
+        slot.consumed_frames = 0u;
+        slot.refill_count = 0u;
+        slot.monitor_frame = 0u;
+        slot.format = 0u;
+        slot.scsp_slot = 0u;
+        slot.playback_buffer = 0u;
+        slot.hardware_playing = 0u;
+        slot.pan = 0u;
+        slot.seamless_loop = 0u;
+        slot.pending_refill = 0u;
+        slot.reserved1 = 0u;
+    }
+}
+
+inline AudioStreamSlot* audio_stream_resolve(
+    AudioStreamRegistry& registry,
+    sat_audio_stream_t stream
+) {
+    if (stream.slot >= kAudioStreamCapacity || stream.generation == 0u) return nullptr;
+    AudioStreamSlot& slot = registry.slots[stream.slot];
+    if (slot.used == 0u || slot.generation != stream.generation) return nullptr;
+    return &slot;
+}
+
+inline const AudioStreamSlot* audio_stream_resolve(
+    const AudioStreamRegistry& registry,
+    sat_audio_stream_t stream
+) {
+    if (stream.slot >= kAudioStreamCapacity || stream.generation == 0u) return nullptr;
+    const AudioStreamSlot& slot = registry.slots[stream.slot];
+    if (slot.used == 0u || slot.generation != stream.generation) return nullptr;
+    return &slot;
+}
+
+inline void audio_stream_update_fill_stats(AudioStreamRing& ring) {
+    if (ring.buffered_frames < ring.minimum_fill) ring.minimum_fill = ring.buffered_frames;
+    if (ring.buffered_frames > ring.maximum_fill) ring.maximum_fill = ring.buffered_frames;
+}
+
+inline void audio_stream_copy_in(
+    AudioStreamRing& ring,
+    const uint8_t* source,
+    uint32_t frame_count
+) {
+    const uint32_t first_frames =
+        frame_count < (ring.capacity_frames - ring.write_frame)
+            ? frame_count : (ring.capacity_frames - ring.write_frame);
+    const uint32_t first_bytes = first_frames * ring.frame_bytes;
+    stream_copy_bytes(ring.buffer + ring.write_frame * ring.frame_bytes,
+                      source, first_bytes);
+    const uint32_t remaining_frames = frame_count - first_frames;
+    stream_copy_bytes(ring.buffer, source + first_bytes,
+                      remaining_frames * ring.frame_bytes);
+    ring.write_frame = (ring.write_frame + frame_count) % ring.capacity_frames;
+    ring.buffered_frames += frame_count;
+    audio_stream_update_fill_stats(ring);
+}
+
+/* Copies up to frame_count frames starting skip_frames past the read cursor
+ * without consuming them, so a failed transfer loses nothing. Returns the
+ * frames copied: fewer when fewer are buffered past skip_frames. */
+inline uint32_t audio_stream_peek(
+    const AudioStreamRing& ring,
+    uint32_t skip_frames,
+    uint8_t* destination,
+    uint32_t frame_count
+) {
+    if (skip_frames >= ring.buffered_frames) return 0u;
+    const uint32_t available = ring.buffered_frames - skip_frames;
+    if (frame_count > available) frame_count = available;
+    const uint32_t start = (ring.read_frame + skip_frames) % ring.capacity_frames;
+    const uint32_t first_frames =
+        frame_count < (ring.capacity_frames - start)
+            ? frame_count : (ring.capacity_frames - start);
+    const uint32_t first_bytes = first_frames * ring.frame_bytes;
+    stream_copy_bytes(destination, ring.buffer + start * ring.frame_bytes,
+                      first_bytes);
+    const uint32_t remaining_frames = frame_count - first_frames;
+    stream_copy_bytes(destination + first_bytes, ring.buffer,
+                      remaining_frames * ring.frame_bytes);
+    return frame_count;
+}
+
+/* Releases frames already delivered; frame_count <= buffered_frames. */
+inline void audio_stream_consume(AudioStreamRing& ring, uint32_t frame_count) {
+    ring.read_frame = (ring.read_frame + frame_count) % ring.capacity_frames;
+    ring.buffered_frames -= frame_count;
+    audio_stream_update_fill_stats(ring);
+}
+
+inline uint32_t audio_stream_copy_out(
+    AudioStreamRing& ring,
+    uint8_t* destination,
+    uint32_t frame_count
+) {
+    if (frame_count > ring.buffered_frames) ++ring.underrun_count;
+    const uint32_t copied = audio_stream_peek(ring, 0u, destination, frame_count);
+    audio_stream_consume(ring, copied);
+    return copied;
+}
+
+/* Hardware-facing service implemented in audio_stream_api.cpp. Large streams
+ * keep one SCSP slot running over a double buffer and refill only the half that
+ * has just finished; small caller buffers retain the bounded one-shot fallback.
+ * At most one steady-state refill is performed per stream per call. */
+void audio_stream_service(
+    AudioStreamRegistry& registry,
+    uint32_t frame_now,
+    uint32_t display_rate = 60u
+);
+void audio_stream_stop_playback(AudioStreamSlot& slot);
+
+}  // namespace saturn::core
+
+#endif /* SATURN_CORE_AUDIO_STREAM_RUNTIME_HPP */
